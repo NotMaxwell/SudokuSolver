@@ -1,20 +1,22 @@
 const std = @import("std");
+const solver_mod = @import("solver.zig");
 
 const RunnerError = error{
     MissingArgument,
     InvalidArgument,
     CsvFormatError,
+    UnsupportedSize,
 };
 
 fn printUsage() void {
     std.debug.print(
         \\Usage:
-        \\  csv_runner --csv <path> [--limit <n>] [--solver <path>]
+        \\  csv_runner --csv <path> [--limit <n>] [--size <n>]
         \\
         \\Options:
         \\  --csv     Path to the CSV file (required, format: puzzle,solution)
         \\  --limit   Max number of puzzles to run (default: 10)
-        \\  --solver  Path to solver executable (default: ./zig-out/bin/solver)
+        \\  --size    Board size (default: 9)
         \\
     , .{});
 }
@@ -27,51 +29,16 @@ fn trimLine(line: []const u8) []const u8 {
     return std.mem.trimRight(u8, line, "\r");
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    var csv_arg: ?[]const u8 = null;
-    var solver_arg: []const u8 = "./zig-out/bin/solver";
-    var limit: usize = 10;
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--csv")) {
-            csv_arg = args.next() orelse return RunnerError.MissingArgument;
-        } else if (std.mem.eql(u8, arg, "--solver")) {
-            solver_arg = args.next() orelse return RunnerError.MissingArgument;
-        } else if (std.mem.eql(u8, arg, "--limit")) {
-            const val = args.next() orelse return RunnerError.MissingArgument;
-            limit = try parseUsize(val);
-        } else if (std.mem.eql(u8, arg, "--help")) {
-            printUsage();
-            return;
-        } else {
-            std.debug.print("Error: unknown argument: {s}\n\n", .{arg});
-            printUsage();
-            return RunnerError.InvalidArgument;
-        }
-    }
-
-    const csv_path = csv_arg orelse {
-        std.debug.print("Error: --csv is required.\n\n", .{});
-        printUsage();
-        return RunnerError.MissingArgument;
-    };
+fn runCsvForSize(comptime size: usize, csv_path: []const u8, limit: usize, allocator: std.mem.Allocator) !void {
+    const B = solver_mod.Board(size);
+    const S = solver_mod.Solver(size);
 
     const file = try std.fs.cwd().openFile(csv_path, .{});
     defer file.close();
 
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var reader = file.reader(&buf);
 
-    // Read the first line: skip it only if it is a known header string,
-    // otherwise treat it as the first data row so puzzle #1 is never lost.
     const first_line_opt = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
         error.StreamTooLong => return RunnerError.CsvFormatError,
         else => return err,
@@ -89,7 +56,9 @@ pub fn main() !void {
     } else {
         std.debug.print("CSV: no header row detected, processing all rows as data\n", .{});
     }
-    std.debug.print("Solver:     {s}\n", .{solver_arg});
+
+    std.debug.print("Mode:       in-process\n", .{});
+    std.debug.print("Size:       {d}x{d}\n", .{ size, size });
     std.debug.print("Limit:      {d}\n\n", .{limit});
 
     var attempted: usize = 0;
@@ -99,13 +68,11 @@ pub fn main() !void {
     var failed: usize = 0;
     var csv_line: usize = 1;
 
-    // If the first line was data (no header), queue it up so the loop processes it first.
     var pending_line: ?[]const u8 = if (!first_is_header) first_trimmed else null;
 
     const start_ns = std.time.nanoTimestamp();
 
     while (attempted < limit) {
-        // Consume pending line first (only set when no header row exists).
         var trimmed: []const u8 = "";
         var got_line = false;
 
@@ -130,107 +97,72 @@ pub fn main() !void {
             }
         }
 
-        if (!got_line) break; // EOF
+        if (!got_line) break;
         if (trimmed.len == 0) continue;
 
-        const comma = std.mem.indexOfScalar(u8, trimmed, ',') orelse {
-            std.debug.print("[{d}] parse error: no comma found\n", .{csv_line});
+        const split_idx: usize = blk: {
+            if (size <= 9) {
+                break :blk std.mem.indexOfScalar(u8, trimmed, ',') orelse {
+                    std.debug.print("[{d}] parse error: no comma found\n", .{csv_line});
+                    failed += 1;
+                    continue;
+                };
+            }
+
+            var comma_count: usize = 0;
+            var idx: usize = 0;
+            while (idx < trimmed.len) : (idx += 1) {
+                if (trimmed[idx] == ',') {
+                    comma_count += 1;
+                    if (comma_count == B.CELL_COUNT) break :blk idx;
+                }
+            }
+            std.debug.print("[{d}] parse error: could not find puzzle/solution boundary\n", .{csv_line});
             failed += 1;
             continue;
         };
 
-        const puzzle = trimmed[0..comma];
-        const expected_solution = trimmed[comma + 1 ..];
+        const puzzle = trimmed[0..split_idx];
+        const expected_solution = trimmed[split_idx + 1 ..];
 
-        if (puzzle.len != 81 or expected_solution.len != 81) {
-            std.debug.print("[{d}] parse error: expected 81-char fields, got puzzle={d} solution={d}\n", .{ csv_line, puzzle.len, expected_solution.len });
+        if (size <= 9 and (puzzle.len != B.CELL_COUNT or expected_solution.len != B.CELL_COUNT)) {
+            std.debug.print(
+                "[{d}] parse error: expected {d}-char fields, got puzzle={d} solution={d}\n",
+                .{ csv_line, B.CELL_COUNT, puzzle.len, expected_solution.len },
+            );
             failed += 1;
             continue;
         }
 
         attempted += 1;
-        std.debug.print("[{d}] puzzle #{d}: {s}\n", .{ csv_line, attempted, puzzle });
-
         const row_start_ns = std.time.nanoTimestamp();
 
-        // Spawn solver --puzzle <puzzle> --compact
-        var child = std.process.Child.init(
-            &.{ solver_arg, "--puzzle", puzzle, "--compact" },
-            allocator,
-        );
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-
-        try child.spawn();
-
-        // Collect stdout and stderr
-        var stdout_list = std.ArrayList(u8){};
-        defer stdout_list.deinit(allocator);
-        var stderr_list = std.ArrayList(u8){};
-        defer stderr_list.deinit(allocator);
-
-        try child.collectOutput(allocator, &stdout_list, &stderr_list, 64 * 1024);
-        const term = try child.wait();
-
-        const row_elapsed_ns: i128 = std.time.nanoTimestamp() - row_start_ns;
-        const row_elapsed_us = @divTrunc(row_elapsed_ns, 1000);
-
-        const exit_ok = switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
+        const board = B.fromString(puzzle) catch {
+            failed += 1;
+            std.debug.print("[{d}] parse error: invalid puzzle\n", .{csv_line});
+            continue;
         };
 
-        if (!exit_ok) {
+        var solver = S.init(board);
+        if (!solver.solve()) {
             failed += 1;
-            std.debug.print("  => FAILED (exit {any}) in {d}us\n", .{ term, row_elapsed_us });
-            if (stderr_list.items.len > 0) {
-                std.debug.print("  stderr: {s}\n", .{std.mem.trimRight(u8, stderr_list.items, "\r\n")});
-            }
+            std.debug.print("[{d}] unsolved\n", .{csv_line});
             continue;
         }
 
         solved += 1;
+        const got_solution = try solver.board.toDigitString(allocator);
+        defer allocator.free(got_solution);
 
-        // Extract solution from stdout: last 81-char run of digits on its own line
-        const stdout = stdout_list.items;
-        var got_solution: ?[]const u8 = null;
+        const row_elapsed_ns: i128 = std.time.nanoTimestamp() - row_start_ns;
+        const row_elapsed_us = @divTrunc(row_elapsed_ns, 1000);
 
-        // The solver prints the board in grid form; we look for the digit-only compact output
-        // by scanning each token separated by whitespace for something 81 chars of 1-9
-        var iter = std.mem.splitScalar(u8, stdout, '\n');
-        while (iter.next()) |sol_line| {
-            const sl = std.mem.trim(u8, sol_line, " \r\t");
-            if (sl.len == 81) {
-                var all_digits = true;
-                for (sl) |c| {
-                    if (c < '1' or c > '9') {
-                        all_digits = false;
-                        break;
-                    }
-                }
-                if (all_digits) {
-                    got_solution = sl;
-                    break;
-                }
-            }
-        }
-
-        if (got_solution) |sol| {
-            std.debug.print("  solved:   {s}\n", .{sol});
-
-            if (std.mem.eql(u8, sol, expected_solution)) {
-                matched += 1;
-                std.debug.print("  => MATCHED in {d}us\n", .{row_elapsed_us});
-            } else {
-                mismatches += 1;
-                std.debug.print("  => MISMATCH in {d}us\n", .{row_elapsed_us});
-                std.debug.print("     got:      {s}\n", .{sol[0..@min(sol.len, 32)]});
-                std.debug.print("     expected: {s}\n", .{expected_solution[0..@min(expected_solution.len, 32)]});
-            }
+        if (std.mem.eql(u8, got_solution, expected_solution)) {
+            matched += 1;
+            std.debug.print("[{d}] puzzle #{d} => MATCHED in {d}us\n", .{ csv_line, attempted, row_elapsed_us });
         } else {
-            // solver solved it but produced grid output with no compact line
-            // compare by reconstructing from grid digits
-            std.debug.print("  => solved (no compact output to compare) in {d}us\n", .{row_elapsed_us});
+            mismatches += 1;
+            std.debug.print("[{d}] puzzle #{d} => MISMATCH in {d}us\n", .{ csv_line, attempted, row_elapsed_us });
         }
     }
 
@@ -252,5 +184,57 @@ pub fn main() !void {
     if (attempted > 0) {
         const avg_us = @divTrunc(elapsed_ns, @as(i128, @intCast(attempted)) * 1_000);
         std.debug.print("avg_us/puzzle: {d}\n", .{avg_us});
+    }
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.next();
+
+    var csv_arg: ?[]const u8 = null;
+    var limit: usize = 10;
+    var size: usize = 9;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--csv")) {
+            csv_arg = args.next() orelse return RunnerError.MissingArgument;
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            const val = args.next() orelse return RunnerError.MissingArgument;
+            limit = try parseUsize(val);
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            const val = args.next() orelse return RunnerError.MissingArgument;
+            size = try parseUsize(val);
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            printUsage();
+            return;
+        } else {
+            std.debug.print("Error: unknown argument: {s}\n\n", .{arg});
+            printUsage();
+            return RunnerError.InvalidArgument;
+        }
+    }
+
+    const csv_path = csv_arg orelse {
+        std.debug.print("Error: --csv is required.\n\n", .{});
+        printUsage();
+        return RunnerError.MissingArgument;
+    };
+
+    switch (size) {
+        4 => try runCsvForSize(4, csv_path, limit, allocator),
+        9 => try runCsvForSize(9, csv_path, limit, allocator),
+        16 => try runCsvForSize(16, csv_path, limit, allocator),
+        25 => try runCsvForSize(25, csv_path, limit, allocator),
+        36 => try runCsvForSize(36, csv_path, limit, allocator),
+        49 => try runCsvForSize(49, csv_path, limit, allocator),
+        64 => try runCsvForSize(64, csv_path, limit, allocator),
+        81 => try runCsvForSize(81, csv_path, limit, allocator),
+        100 => try runCsvForSize(100, csv_path, limit, allocator),
+        else => return RunnerError.UnsupportedSize,
     }
 }

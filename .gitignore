@@ -2,3 +2,7 @@ zig-out/
 .zig-cache/
 .csv
 .7z
+@s"
+sudoku.csv
+sudoku.7z
+"@ >> .gitignore

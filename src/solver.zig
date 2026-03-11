@@ -228,29 +228,34 @@ pub fn Solver(comptime size: comptime_int) type {
     const B = Board(size);
     return struct {
         const Self = @This();
+        const CELL_COUNT = B.CELL_COUNT;
         board: B,
+        candidate_mask: [CELL_COUNT]u128,
+        candidate_count: [CELL_COUNT]u8,
+
+        const Placement = struct {
+            row: usize,
+            col: usize,
+            value: u16,
+        };
+
+        const UnitSingle = struct {
+            index: usize,
+            value: u16,
+        };
 
         pub fn init(board: B) Self {
-            return .{ .board = board };
+            var self = Self{
+                .board = board,
+                .candidate_mask = [_]u128{0} ** CELL_COUNT,
+                .candidate_count = [_]u8{0} ** CELL_COUNT,
+            };
+            self.recomputeAllCandidates();
+            return self;
         }
 
         pub fn solve(self: *Self) bool {
-            const next = self.findBestCell() orelse return true;
-            if (next.mask == 0) return false;
-
-            var mask = next.mask;
-            while (mask != 0) {
-                const low_bit = mask & (~mask +% 1);
-                const value: u16 = @as(u16, @intCast(@ctz(low_bit))) + 1;
-
-                self.board.place(next.row, next.col, value);
-                if (self.solve()) return true;
-                self.board.remove(next.row, next.col, value);
-
-                mask &= mask - 1;
-            }
-
-            return false;
+            return self.search();
         }
 
         const BestCell = struct {
@@ -259,6 +264,331 @@ pub fn Solver(comptime size: comptime_int) type {
             mask: u128,
         };
 
+        inline fn rowOfIndex(index: usize) usize {
+            return index / B.SIZE;
+        }
+
+        inline fn colOfIndex(index: usize) usize {
+            return index % B.SIZE;
+        }
+
+        inline fn boxOfIndex(index: usize) usize {
+            const row = rowOfIndex(index);
+            const col = colOfIndex(index);
+            return (row / B.BOX_SIZE) * B.BOX_SIZE + (col / B.BOX_SIZE);
+        }
+
+        fn recomputeAllCandidates(self: *Self) void {
+            var idx: usize = 0;
+            while (idx < CELL_COUNT) : (idx += 1) {
+                self.refreshCandidateAt(idx);
+            }
+        }
+
+        fn refreshCandidateAt(self: *Self, idx: usize) void {
+            const row = rowOfIndex(idx);
+            const col = colOfIndex(idx);
+            if (self.board.get(row, col) != 0) {
+                self.candidate_mask[idx] = 0;
+                self.candidate_count[idx] = 0;
+                return;
+            }
+
+            const mask = self.board.candidatesMask(row, col);
+            self.candidate_mask[idx] = mask;
+            self.candidate_count[idx] = @intCast(@popCount(mask));
+        }
+
+        fn refreshAffected(self: *Self, row: usize, col: usize) void {
+            var c: usize = 0;
+            while (c < B.SIZE) : (c += 1) {
+                self.refreshCandidateAt(B.cellIndex(row, c));
+            }
+
+            var r: usize = 0;
+            while (r < B.SIZE) : (r += 1) {
+                if (r == row) continue;
+                self.refreshCandidateAt(B.cellIndex(r, col));
+            }
+
+            const box_row_start = (row / B.BOX_SIZE) * B.BOX_SIZE;
+            const box_col_start = (col / B.BOX_SIZE) * B.BOX_SIZE;
+            r = box_row_start;
+            while (r < box_row_start + B.BOX_SIZE) : (r += 1) {
+                c = box_col_start;
+                while (c < box_col_start + B.BOX_SIZE) : (c += 1) {
+                    if (r == row or c == col) continue;
+                    self.refreshCandidateAt(B.cellIndex(r, c));
+                }
+            }
+
+            self.refreshCandidateAt(B.cellIndex(row, col));
+        }
+
+        fn applyPlacement(self: *Self, row: usize, col: usize, value: u16, placements: *[CELL_COUNT]Placement, placement_count: *usize) void {
+            self.board.place(row, col, value);
+            placements[placement_count.*] = .{ .row = row, .col = col, .value = value };
+            placement_count.* += 1;
+            self.refreshAffected(row, col);
+        }
+
+        fn revertPlacements(self: *Self, placements: *const [CELL_COUNT]Placement, start: usize, end: usize) void {
+            var i = end;
+            while (i > start) {
+                i -= 1;
+                const p = placements[i];
+                self.board.remove(p.row, p.col, p.value);
+                self.refreshAffected(p.row, p.col);
+            }
+        }
+
+        fn findForcedNakedSingle(self: *const Self) ?UnitSingle {
+            var idx: usize = 0;
+            while (idx < CELL_COUNT) : (idx += 1) {
+                if (self.candidate_count[idx] == 1) {
+                    const value: u16 = @as(u16, @intCast(@ctz(self.candidate_mask[idx]))) + 1;
+                    return .{ .index = idx, .value = value };
+                }
+            }
+            return null;
+        }
+
+        fn findHiddenSingleInRow(self: *const Self, row: usize) ?UnitSingle {
+            var counts: [B.SIZE]u8 = [_]u8{0} ** B.SIZE;
+            var last_idx: [B.SIZE]usize = [_]usize{0} ** B.SIZE;
+
+            var col: usize = 0;
+            while (col < B.SIZE) : (col += 1) {
+                const idx = B.cellIndex(row, col);
+                const mask = self.candidate_mask[idx];
+                if (mask == 0) continue;
+
+                var bits = mask;
+                while (bits != 0) {
+                    const low_bit = bits & (~bits +% 1);
+                    const value_idx = @as(usize, @intCast(@ctz(low_bit)));
+                    counts[value_idx] +%= 1;
+                    last_idx[value_idx] = idx;
+                    bits &= bits - 1;
+                }
+            }
+
+            var value_idx: usize = 0;
+            while (value_idx < B.SIZE) : (value_idx += 1) {
+                if (counts[value_idx] == 1) {
+                    return .{ .index = last_idx[value_idx], .value = @intCast(value_idx + 1) };
+                }
+            }
+            return null;
+        }
+
+        fn findHiddenSingleInCol(self: *const Self, col: usize) ?UnitSingle {
+            var counts: [B.SIZE]u8 = [_]u8{0} ** B.SIZE;
+            var last_idx: [B.SIZE]usize = [_]usize{0} ** B.SIZE;
+
+            var row: usize = 0;
+            while (row < B.SIZE) : (row += 1) {
+                const idx = B.cellIndex(row, col);
+                const mask = self.candidate_mask[idx];
+                if (mask == 0) continue;
+
+                var bits = mask;
+                while (bits != 0) {
+                    const low_bit = bits & (~bits +% 1);
+                    const value_idx = @as(usize, @intCast(@ctz(low_bit)));
+                    counts[value_idx] +%= 1;
+                    last_idx[value_idx] = idx;
+                    bits &= bits - 1;
+                }
+            }
+
+            var value_idx: usize = 0;
+            while (value_idx < B.SIZE) : (value_idx += 1) {
+                if (counts[value_idx] == 1) {
+                    return .{ .index = last_idx[value_idx], .value = @intCast(value_idx + 1) };
+                }
+            }
+            return null;
+        }
+
+        fn findHiddenSingleInBox(self: *const Self, box: usize) ?UnitSingle {
+            var counts: [B.SIZE]u8 = [_]u8{0} ** B.SIZE;
+            var last_idx: [B.SIZE]usize = [_]usize{0} ** B.SIZE;
+
+            const box_row = (box / B.BOX_SIZE) * B.BOX_SIZE;
+            const box_col = (box % B.BOX_SIZE) * B.BOX_SIZE;
+
+            var row: usize = box_row;
+            while (row < box_row + B.BOX_SIZE) : (row += 1) {
+                var col: usize = box_col;
+                while (col < box_col + B.BOX_SIZE) : (col += 1) {
+                    const idx = B.cellIndex(row, col);
+                    const mask = self.candidate_mask[idx];
+                    if (mask == 0) continue;
+
+                    var bits = mask;
+                    while (bits != 0) {
+                        const low_bit = bits & (~bits +% 1);
+                        const value_idx = @as(usize, @intCast(@ctz(low_bit)));
+                        counts[value_idx] +%= 1;
+                        last_idx[value_idx] = idx;
+                        bits &= bits - 1;
+                    }
+                }
+            }
+
+            var value_idx: usize = 0;
+            while (value_idx < B.SIZE) : (value_idx += 1) {
+                if (counts[value_idx] == 1) {
+                    return .{ .index = last_idx[value_idx], .value = @intCast(value_idx + 1) };
+                }
+            }
+            return null;
+        }
+
+        fn findForcedHiddenSingle(self: *const Self) ?UnitSingle {
+            var row: usize = 0;
+            while (row < B.SIZE) : (row += 1) {
+                if (self.findHiddenSingleInRow(row)) |single| return single;
+            }
+
+            var col: usize = 0;
+            while (col < B.SIZE) : (col += 1) {
+                if (self.findHiddenSingleInCol(col)) |single| return single;
+            }
+
+            var box: usize = 0;
+            while (box < B.SIZE) : (box += 1) {
+                if (self.findHiddenSingleInBox(box)) |single| return single;
+            }
+
+            return null;
+        }
+
+        fn hasContradiction(self: *const Self) bool {
+            var idx: usize = 0;
+            while (idx < CELL_COUNT) : (idx += 1) {
+                const row = rowOfIndex(idx);
+                const col = colOfIndex(idx);
+                if (self.board.get(row, col) == 0 and self.candidate_count[idx] == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn propagateConstraints(self: *Self, placements: *[CELL_COUNT]Placement, placement_count: *usize) bool {
+            while (true) {
+                if (self.hasContradiction()) return false;
+
+                if (self.findForcedNakedSingle()) |single| {
+                    const row = rowOfIndex(single.index);
+                    const col = colOfIndex(single.index);
+                    self.applyPlacement(row, col, single.value, placements, placement_count);
+                    continue;
+                }
+
+                if (self.findForcedHiddenSingle()) |single| {
+                    const row = rowOfIndex(single.index);
+                    const col = colOfIndex(single.index);
+                    self.applyPlacement(row, col, single.value, placements, placement_count);
+                    continue;
+                }
+
+                break;
+            }
+
+            return true;
+        }
+
+        fn scoreCandidateLCV(self: *const Self, row: usize, col: usize, value: u16) usize {
+            const target_idx = B.cellIndex(row, col);
+            const target_box = boxOfIndex(target_idx);
+            const bit = @as(u128, 1) << @intCast(value - 1);
+
+            var score: usize = 0;
+            var idx: usize = 0;
+            while (idx < CELL_COUNT) : (idx += 1) {
+                if (idx == target_idx) continue;
+                const r = rowOfIndex(idx);
+                const c = colOfIndex(idx);
+                if (self.board.get(r, c) != 0) continue;
+                if (r == row or c == col or boxOfIndex(idx) == target_box) {
+                    if ((self.candidate_mask[idx] & bit) != 0) score += 1;
+                }
+            }
+            return score;
+        }
+
+        fn orderCandidatesLCV(self: *const Self, row: usize, col: usize, mask: u128, out_values: *[B.SIZE]u16) usize {
+            var values: [B.SIZE]u16 = [_]u16{0} ** B.SIZE;
+            var scores: [B.SIZE]usize = [_]usize{0} ** B.SIZE;
+            var count: usize = 0;
+
+            var bits = mask;
+            while (bits != 0) {
+                const low_bit = bits & (~bits +% 1);
+                const value: u16 = @as(u16, @intCast(@ctz(low_bit))) + 1;
+                values[count] = value;
+                scores[count] = self.scoreCandidateLCV(row, col, value);
+                count += 1;
+                bits &= bits - 1;
+            }
+
+            var i: usize = 1;
+            while (i < count) : (i += 1) {
+                const value = values[i];
+                const score = scores[i];
+                var j = i;
+                while (j > 0 and scores[j - 1] > score) : (j -= 1) {
+                    values[j] = values[j - 1];
+                    scores[j] = scores[j - 1];
+                }
+                values[j] = value;
+                scores[j] = score;
+            }
+
+            var k: usize = 0;
+            while (k < count) : (k += 1) {
+                out_values[k] = values[k];
+            }
+            return count;
+        }
+
+        fn search(self: *Self) bool {
+            var placements: [CELL_COUNT]Placement = undefined;
+            var placement_count: usize = 0;
+
+            if (!self.propagateConstraints(&placements, &placement_count)) {
+                self.revertPlacements(&placements, 0, placement_count);
+                return false;
+            }
+
+            const next = self.findBestCell() orelse return true;
+            if (next.mask == 0) {
+                self.revertPlacements(&placements, 0, placement_count);
+                return false;
+            }
+
+            var ordered_values: [B.SIZE]u16 = [_]u16{0} ** B.SIZE;
+            const candidate_len = self.orderCandidatesLCV(next.row, next.col, next.mask, &ordered_values);
+
+            var i: usize = 0;
+            while (i < candidate_len) : (i += 1) {
+                const value = ordered_values[i];
+                self.board.place(next.row, next.col, value);
+                self.refreshAffected(next.row, next.col);
+
+                if (self.search()) return true;
+
+                self.board.remove(next.row, next.col, value);
+                self.refreshAffected(next.row, next.col);
+            }
+
+            self.revertPlacements(&placements, 0, placement_count);
+            return false;
+        }
+
         fn findBestCell(self: *const Self) ?BestCell {
             var found = false;
             var best_row: usize = 0;
@@ -266,29 +596,28 @@ pub fn Solver(comptime size: comptime_int) type {
             var best_mask: u128 = 0;
             var best_count: u32 = B.SIZE + 1;
 
-            var row: usize = 0;
-            while (row < B.SIZE) : (row += 1) {
-                var col: usize = 0;
-                while (col < B.SIZE) : (col += 1) {
-                    if (self.board.get(row, col) != 0) continue;
+            var idx: usize = 0;
+            while (idx < CELL_COUNT) : (idx += 1) {
+                const row = rowOfIndex(idx);
+                const col = colOfIndex(idx);
+                if (self.board.get(row, col) != 0) continue;
 
-                    const mask = self.board.candidatesMask(row, col);
-                    const count: u32 = @popCount(mask);
+                const count: u32 = self.candidate_count[idx];
+                const mask = self.candidate_mask[idx];
 
-                    if (count == 0) {
-                        return .{ .row = row, .col = col, .mask = 0 };
-                    }
+                if (count == 0) {
+                    return .{ .row = row, .col = col, .mask = 0 };
+                }
 
-                    if (!found or count < best_count) {
-                        found = true;
-                        best_row = row;
-                        best_col = col;
-                        best_mask = mask;
-                        best_count = count;
+                if (!found or count < best_count) {
+                    found = true;
+                    best_row = row;
+                    best_col = col;
+                    best_mask = mask;
+                    best_count = count;
 
-                        if (count == 1) {
-                            return .{ .row = best_row, .col = best_col, .mask = best_mask };
-                        }
+                    if (count == 1) {
+                        return .{ .row = best_row, .col = best_col, .mask = best_mask };
                     }
                 }
             }
