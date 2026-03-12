@@ -258,6 +258,95 @@ pub fn Solver(comptime size: comptime_int) type {
             return self.search();
         }
 
+        pub fn solveParallel(self: *Self) bool {
+            var root = self.*;
+
+            var placements: [CELL_COUNT]Placement = undefined;
+            var placement_count: usize = 0;
+            if (!root.propagateConstraints(&placements, &placement_count)) {
+                return false;
+            }
+
+            const next = root.findBestCell() orelse {
+                self.* = root;
+                return true;
+            };
+            if (next.mask == 0) return false;
+
+            var ordered_values: [B.SIZE]u16 = [_]u16{0} ** B.SIZE;
+            const candidate_len = root.orderCandidatesLCV(next.row, next.col, next.mask, &ordered_values);
+            if (candidate_len <= 1) {
+                if (root.search()) {
+                    self.* = root;
+                    return true;
+                }
+                return false;
+            }
+
+            const ParallelSolveContext = struct {
+                root: Self,
+                row: usize,
+                col: usize,
+                found: bool = false,
+                solution_board: B = B.initEmpty(),
+                mutex: std.Thread.Mutex = .{},
+
+                fn worker(ctx: *@This(), value: u16) void {
+                    ctx.mutex.lock();
+                    if (ctx.found) {
+                        ctx.mutex.unlock();
+                        return;
+                    }
+                    ctx.mutex.unlock();
+
+                    var local = ctx.root;
+                    local.board.place(ctx.row, ctx.col, value);
+                    local.refreshAffected(ctx.row, ctx.col);
+
+                    if (local.search()) {
+                        ctx.mutex.lock();
+                        if (!ctx.found) {
+                            ctx.found = true;
+                            ctx.solution_board = local.board;
+                        }
+                        ctx.mutex.unlock();
+                    }
+                }
+            };
+
+            var ctx = ParallelSolveContext{
+                .root = root,
+                .row = next.row,
+                .col = next.col,
+            };
+
+            var threads: [B.SIZE]std.Thread = undefined;
+            var spawned: usize = 0;
+            var t: usize = 0;
+            while (t < candidate_len) : (t += 1) {
+                const value = ordered_values[t];
+                const th = std.Thread.spawn(.{}, ParallelSolveContext.worker, .{ &ctx, value }) catch {
+                    ParallelSolveContext.worker(&ctx, value);
+                    continue;
+                };
+                threads[spawned] = th;
+                spawned += 1;
+            }
+
+            t = 0;
+            while (t < spawned) : (t += 1) {
+                threads[t].join();
+            }
+
+            if (ctx.found) {
+                self.board = ctx.solution_board;
+                self.recomputeAllCandidates();
+                return true;
+            }
+
+            return false;
+        }
+
         const BestCell = struct {
             row: usize,
             col: usize,
@@ -346,7 +435,9 @@ pub fn Solver(comptime size: comptime_int) type {
             var idx: usize = 0;
             while (idx < CELL_COUNT) : (idx += 1) {
                 if (self.candidate_count[idx] == 1) {
-                    const value: u16 = @as(u16, @intCast(@ctz(self.candidate_mask[idx]))) + 1;
+                    const value_idx = @as(usize, @intCast(@ctz(self.candidate_mask[idx])));
+                    if (value_idx >= B.SIZE) continue;
+                    const value: u16 = @intCast(value_idx + 1);
                     return .{ .index = idx, .value = value };
                 }
             }
@@ -367,8 +458,10 @@ pub fn Solver(comptime size: comptime_int) type {
                 while (bits != 0) {
                     const low_bit = bits & (~bits +% 1);
                     const value_idx = @as(usize, @intCast(@ctz(low_bit)));
-                    counts[value_idx] +%= 1;
-                    last_idx[value_idx] = idx;
+                    if (value_idx < B.SIZE) {
+                        counts[value_idx] +%= 1;
+                        last_idx[value_idx] = idx;
+                    }
                     bits &= bits - 1;
                 }
             }
@@ -396,8 +489,10 @@ pub fn Solver(comptime size: comptime_int) type {
                 while (bits != 0) {
                     const low_bit = bits & (~bits +% 1);
                     const value_idx = @as(usize, @intCast(@ctz(low_bit)));
-                    counts[value_idx] +%= 1;
-                    last_idx[value_idx] = idx;
+                    if (value_idx < B.SIZE) {
+                        counts[value_idx] +%= 1;
+                        last_idx[value_idx] = idx;
+                    }
                     bits &= bits - 1;
                 }
             }
@@ -430,8 +525,10 @@ pub fn Solver(comptime size: comptime_int) type {
                     while (bits != 0) {
                         const low_bit = bits & (~bits +% 1);
                         const value_idx = @as(usize, @intCast(@ctz(low_bit)));
-                        counts[value_idx] +%= 1;
-                        last_idx[value_idx] = idx;
+                        if (value_idx < B.SIZE) {
+                            counts[value_idx] +%= 1;
+                            last_idx[value_idx] = idx;
+                        }
                         bits &= bits - 1;
                     }
                 }
@@ -528,10 +625,13 @@ pub fn Solver(comptime size: comptime_int) type {
             var bits = mask;
             while (bits != 0) {
                 const low_bit = bits & (~bits +% 1);
-                const value: u16 = @as(u16, @intCast(@ctz(low_bit))) + 1;
-                values[count] = value;
-                scores[count] = self.scoreCandidateLCV(row, col, value);
-                count += 1;
+                const value_idx = @as(usize, @intCast(@ctz(low_bit)));
+                if (value_idx < B.SIZE and count < B.SIZE) {
+                    const value: u16 = @intCast(value_idx + 1);
+                    values[count] = value;
+                    scores[count] = self.scoreCandidateLCV(row, col, value);
+                    count += 1;
+                }
                 bits &= bits - 1;
             }
 
@@ -556,17 +656,20 @@ pub fn Solver(comptime size: comptime_int) type {
         }
 
         fn search(self: *Self) bool {
-            var placements: [CELL_COUNT]Placement = undefined;
+            // Allocate on the heap to avoid stack overflow on large puzzles
+            // (for size=100, [CELL_COUNT]Placement = 10000 * 24 bytes = ~240KB per frame).
+            const placements = std.heap.page_allocator.create([CELL_COUNT]Placement) catch return false;
+            defer std.heap.page_allocator.destroy(placements);
             var placement_count: usize = 0;
 
-            if (!self.propagateConstraints(&placements, &placement_count)) {
-                self.revertPlacements(&placements, 0, placement_count);
+            if (!self.propagateConstraints(placements, &placement_count)) {
+                self.revertPlacements(placements, 0, placement_count);
                 return false;
             }
 
             const next = self.findBestCell() orelse return true;
             if (next.mask == 0) {
-                self.revertPlacements(&placements, 0, placement_count);
+                self.revertPlacements(placements, 0, placement_count);
                 return false;
             }
 
@@ -585,7 +688,7 @@ pub fn Solver(comptime size: comptime_int) type {
                 self.refreshAffected(next.row, next.col);
             }
 
-            self.revertPlacements(&placements, 0, placement_count);
+            self.revertPlacements(placements, 0, placement_count);
             return false;
         }
 
@@ -675,13 +778,15 @@ fn printUsage() void {
     std.debug.print(
         \\Usage:
         \\  solver --puzzle "<puzzle string>" [--compact] [--size <n>]
-        \\  solver --csv <path> [--limit <n>] [--size <n>]
+        \\  solver --csv <path> [--limit <n>] [--size <n>] [--threads <n>]
         \\
         \\Options:
         \\  --puzzle   Solve a single puzzle
         \\  --compact  Output only the compact solution string (no grid)
         \\  --csv      Solve puzzles from a CSV file (puzzle,solution columns)
         \\  --limit    Max puzzles from CSV (default: 100)
+        \\  --threads  Worker threads for CSV rows (default: 1)
+        \\            Branching threads are auto-sized per puzzle candidate count
         \\  --size     Board size: 4, 9, 16, 25, 36, 49, 64, 81, 100.
         \\             Auto-detected from puzzle length when omitted.
         \\
@@ -718,6 +823,44 @@ fn inferSize(puzzle: []const u8) ?usize {
     return isqrt(count);
 }
 
+fn solutionMatchesForSize(comptime size: usize, board: *const Board(size), solution: []const u8) bool {
+    const CELL_COUNT = Board(size).CELL_COUNT;
+    if (size <= 9) {
+        if (solution.len != CELL_COUNT) return false;
+        var idx: usize = 0;
+        while (idx < CELL_COUNT) : (idx += 1) {
+            const expected = solution[idx];
+            if (expected < '1' or expected > '0' + size) return false;
+            const row = idx / size;
+            const col = idx % size;
+            if (board.get(row, col) != expected - '0') return false;
+        }
+        return true;
+    }
+
+    var cell: usize = 0;
+    var i: usize = 0;
+    while (i < solution.len and cell < CELL_COUNT) {
+        while (i < solution.len and (solution[i] == ',' or solution[i] == ' ' or solution[i] == '\n' or solution[i] == '\r' or solution[i] == '\t')) : (i += 1) {}
+        if (i >= solution.len) break;
+
+        const start = i;
+        while (i < solution.len and solution[i] >= '0' and solution[i] <= '9') : (i += 1) {}
+        if (i == start) return false;
+
+        const token = solution[start..i];
+        const expected = std.fmt.parseUnsigned(u16, token, 10) catch return false;
+
+        const row = cell / size;
+        const col = cell % size;
+        if (board.get(row, col) != expected) return false;
+        cell += 1;
+    }
+
+    while (i < solution.len and (solution[i] == ',' or solution[i] == ' ' or solution[i] == '\n' or solution[i] == '\r' or solution[i] == '\t')) : (i += 1) {}
+    return cell == CELL_COUNT and i == solution.len;
+}
+
 fn runSinglePuzzleForSize(comptime size: usize, puzzle: []const u8, compact: bool, allocator: std.mem.Allocator) !void {
     const B = Board(size);
     const S = Solver(size);
@@ -740,7 +883,8 @@ fn runSinglePuzzleForSize(comptime size: usize, puzzle: []const u8, compact: boo
 
     var solver = S.init(board);
 
-    if (solver.solve()) {
+    const solved = solver.solveParallel();
+    if (solved) {
         if (compact) {
             const out = try solver.board.toDigitString(allocator);
             defer allocator.free(out);
@@ -780,12 +924,15 @@ fn runSinglePuzzle(puzzle: []const u8, compact: bool, size_hint: ?usize, allocat
     }
 }
 
-fn runCsvModeForSize(comptime size: usize, csv_path: []const u8, limit: usize, allocator: std.mem.Allocator) !void {
+fn runCsvModeForSize(comptime size: usize, csv_path: []const u8, limit: usize, csv_threads: usize, allocator: std.mem.Allocator) !void {
     const B = Board(size);
     const S = Solver(size);
 
-    const debug_config = CsvDebugConfig{};
-    const progress_every: usize = if (limit <= 100) 1 else if (limit <= 1000) 100 else 1000;
+    const Job = struct {
+        puzzle: []u8,
+        solution: []u8,
+        csv_line: usize,
+    };
 
     const file = try std.fs.cwd().openFile(csv_path, .{});
     defer file.close();
@@ -809,10 +956,18 @@ fn runCsvModeForSize(comptime size: usize, csv_path: []const u8, limit: usize, a
     std.debug.print("CSV: file={s} size={d}x{d} limit={d}\n", .{ csv_path, size, size, limit });
 
     var stats = CsvStats{};
-    const start_ns = std.time.nanoTimestamp();
+    var jobs = std.ArrayList(Job).empty;
+    defer {
+        for (jobs.items) |job| {
+            allocator.free(job.puzzle);
+            allocator.free(job.solution);
+        }
+        jobs.deinit(allocator);
+    }
+
     var csv_line_number: usize = 1;
 
-    while (stats.attempted < limit) {
+    while (jobs.items.len < limit) {
         const line_opt = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
                 stats.parse_errors += 1;
@@ -853,67 +1008,113 @@ fn runCsvModeForSize(comptime size: usize, csv_path: []const u8, limit: usize, a
         const puzzle_str = trimmed[0..split_idx];
         const solution_str = trimmed[split_idx + 1 ..];
 
-        stats.attempted += 1;
+        const puzzle_copy = try allocator.dupe(u8, puzzle_str);
+        errdefer allocator.free(puzzle_copy);
+        const solution_copy = try allocator.dupe(u8, solution_str);
+        errdefer allocator.free(solution_copy);
 
-        if (stats.attempted % progress_every == 0) {
-            const now = std.time.nanoTimestamp();
-            const elapsed_ns: i128 = now - start_ns;
-            const rate: i128 = if (elapsed_ns > 0)
-                @divTrunc(@as(i128, @intCast(stats.attempted)) * 1_000_000_000, elapsed_ns)
-            else
-                0;
-            std.debug.print(
-                "progress: {d}/{d} solved:{d} matched:{d} rate:{d}/s\n",
-                .{ stats.attempted, limit, stats.solved, stats.matched, rate },
-            );
-        }
-
-        const board = B.fromString(puzzle_str) catch {
-            stats.parse_errors += 1;
-            if (stats.parse_errors <= debug_config.max_detailed_logs) {
-                std.debug.print(
-                    "detail[parse_error #{d}] csv_line={d} sample=\"{s}\"\n",
-                    .{ stats.parse_errors, csv_line_number, truncForLog(puzzle_str, 40) },
-                );
-            }
-            continue;
-        };
-
-        var solver = S.init(board);
-
-        if (!solver.solve()) {
-            stats.unsolved += 1;
-            if (stats.unsolved <= debug_config.max_detailed_logs) {
-                std.debug.print(
-                    "detail[unsolved #{d}] csv_line={d} sample=\"{s}\"\n",
-                    .{ stats.unsolved, csv_line_number, truncForLog(puzzle_str, 40) },
-                );
-            }
-            continue;
-        }
-
-        stats.solved += 1;
-
-        const solved_str = try solver.board.toDigitString(allocator);
-        defer allocator.free(solved_str);
-
-        if (std.mem.eql(u8, solved_str, solution_str)) {
-            stats.matched += 1;
-        } else {
-            stats.mismatches += 1;
-            if (stats.mismatches <= debug_config.max_detailed_logs) {
-                std.debug.print(
-                    "detail[mismatch #{d}] csv_line={d} got=\"{s}\" expected=\"{s}\"\n",
-                    .{
-                        stats.mismatches,
-                        csv_line_number,
-                        truncForLog(solved_str, 32),
-                        truncForLog(solution_str, 32),
-                    },
-                );
-            }
-        }
+        try jobs.append(allocator, .{
+            .puzzle = puzzle_copy,
+            .solution = solution_copy,
+            .csv_line = csv_line_number,
+        });
     }
+
+    stats.attempted = jobs.items.len;
+    const start_ns = std.time.nanoTimestamp();
+
+    const worker_count = @max(@as(usize, 1), @min(csv_threads, @max(@as(usize, 1), jobs.items.len)));
+
+    const CsvContext = struct {
+        jobs: []const Job,
+        next_index: usize = 0,
+        solved: usize = 0,
+        matched: usize = 0,
+        unsolved: usize = 0,
+        parse_errors: usize = 0,
+        mismatches: usize = 0,
+        mutex: std.Thread.Mutex = .{},
+
+        fn worker(ctx: *@This()) void {
+            var local_solved: usize = 0;
+            var local_matched: usize = 0;
+            var local_unsolved: usize = 0;
+            var local_parse_errors: usize = 0;
+            var local_mismatches: usize = 0;
+
+            while (true) {
+                var maybe_idx: ?usize = null;
+                ctx.mutex.lock();
+                if (ctx.next_index < ctx.jobs.len) {
+                    maybe_idx = ctx.next_index;
+                    ctx.next_index += 1;
+                }
+                ctx.mutex.unlock();
+
+                const idx = maybe_idx orelse break;
+                const job = ctx.jobs[idx];
+                _ = job.csv_line;
+
+                const board = B.fromString(job.puzzle) catch {
+                    local_parse_errors += 1;
+                    continue;
+                };
+
+                var solver = S.init(board);
+                const solved = solver.solveParallel();
+                if (!solved) {
+                    local_unsolved += 1;
+                    continue;
+                }
+
+                local_solved += 1;
+
+                if (solutionMatchesForSize(size, &solver.board, job.solution)) {
+                    local_matched += 1;
+                } else {
+                    local_mismatches += 1;
+                }
+            }
+
+            ctx.mutex.lock();
+            ctx.solved += local_solved;
+            ctx.matched += local_matched;
+            ctx.unsolved += local_unsolved;
+            ctx.parse_errors += local_parse_errors;
+            ctx.mismatches += local_mismatches;
+            ctx.mutex.unlock();
+        }
+    };
+
+    var ctx = CsvContext{
+        .jobs = jobs.items,
+    };
+
+    var threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    var spawned: usize = 0;
+    var t: usize = 0;
+    while (t < worker_count) : (t += 1) {
+        const th = std.Thread.spawn(.{}, CsvContext.worker, .{&ctx}) catch break;
+        threads[spawned] = th;
+        spawned += 1;
+    }
+
+    if (spawned < worker_count) {
+        CsvContext.worker(&ctx);
+    }
+
+    t = 0;
+    while (t < spawned) : (t += 1) {
+        threads[t].join();
+    }
+
+    stats.solved = ctx.solved;
+    stats.matched = ctx.matched;
+    stats.unsolved = ctx.unsolved;
+    stats.parse_errors += ctx.parse_errors;
+    stats.mismatches = ctx.mismatches;
 
     const elapsed_ns: i128 = std.time.nanoTimestamp() - start_ns;
     const elapsed_ms = @divTrunc(elapsed_ns, 1_000_000);
@@ -932,17 +1133,17 @@ fn runCsvModeForSize(comptime size: usize, csv_path: []const u8, limit: usize, a
     }
 }
 
-fn runCsvMode(csv_path: []const u8, limit: usize, size: usize, allocator: std.mem.Allocator) !void {
+fn runCsvMode(csv_path: []const u8, limit: usize, size: usize, csv_threads: usize, allocator: std.mem.Allocator) !void {
     switch (size) {
-        4 => try runCsvModeForSize(4, csv_path, limit, allocator),
-        9 => try runCsvModeForSize(9, csv_path, limit, allocator),
-        16 => try runCsvModeForSize(16, csv_path, limit, allocator),
-        25 => try runCsvModeForSize(25, csv_path, limit, allocator),
-        36 => try runCsvModeForSize(36, csv_path, limit, allocator),
-        49 => try runCsvModeForSize(49, csv_path, limit, allocator),
-        64 => try runCsvModeForSize(64, csv_path, limit, allocator),
-        81 => try runCsvModeForSize(81, csv_path, limit, allocator),
-        100 => try runCsvModeForSize(100, csv_path, limit, allocator),
+        4 => try runCsvModeForSize(4, csv_path, limit, csv_threads, allocator),
+        9 => try runCsvModeForSize(9, csv_path, limit, csv_threads, allocator),
+        16 => try runCsvModeForSize(16, csv_path, limit, csv_threads, allocator),
+        25 => try runCsvModeForSize(25, csv_path, limit, csv_threads, allocator),
+        36 => try runCsvModeForSize(36, csv_path, limit, csv_threads, allocator),
+        49 => try runCsvModeForSize(49, csv_path, limit, csv_threads, allocator),
+        64 => try runCsvModeForSize(64, csv_path, limit, csv_threads, allocator),
+        81 => try runCsvModeForSize(81, csv_path, limit, csv_threads, allocator),
+        100 => try runCsvModeForSize(100, csv_path, limit, csv_threads, allocator),
         else => {
             std.debug.print("Error: unsupported board size {d}.\n", .{size});
             return SudokuError.UnsupportedSize;
@@ -964,6 +1165,7 @@ pub fn main() !void {
     var limit: usize = 100;
     var compact: bool = false;
     var size_arg: ?usize = null;
+    var csv_threads: usize = 1;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--puzzle")) {
@@ -978,6 +1180,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--size")) {
             const value = args.next() orelse return SudokuError.MissingArgument;
             size_arg = try parseUsize(value);
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            const value = args.next() orelse return SudokuError.MissingArgument;
+            csv_threads = try parseUsize(value);
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
@@ -1001,7 +1206,7 @@ pub fn main() !void {
 
     if (csv_arg) |csv_path| {
         const size = size_arg orelse 9;
-        try runCsvMode(csv_path, limit, size, allocator);
+        try runCsvMode(csv_path, limit, size, csv_threads, allocator);
         return;
     }
 
